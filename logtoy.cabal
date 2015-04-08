@@ -16,7 +16,13 @@ executable logtoy
                      , base >=4.7 && <4.8
                      , bytestring
                      , containers
+                     , directory
+                     , http-types
+                     , QuickCheck
                      , stm
+                     , system-filepath
                      , text
+                     , text-format
                      , wai
                      , warp
+                     , warp-tls
