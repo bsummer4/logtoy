@@ -13,6 +13,7 @@ executable logtoy
   main-is:             Main.hs
   default-language:    Haskell2010
   build-depends:       aeson
+                     , attoparsec
                      , base >=4.7 && <4.8
                      , bytestring
                      , containers

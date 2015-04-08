@@ -1,17 +1,19 @@
 {-# LANGUAGE LambdaCase, OverloadedStrings, ScopedTypeVariables #-}
 {-# LANGUAGE UnicodeSyntax                                      #-}
 
--- # IO Edge Cases
--- TODO Catch exceptions caused by non-existent files.
--- TODO Where should log files be written?
--- TODO What if creating the log directory fails?
+-- Handling of IOErrors probably deserves more attention, however warp
+-- seems to do the right thing when it encounters unexpected IO errors. It
+-- returns a 500 error and prints a warning to stderr.
+
+-- `fsync()` might be worth consideration. Do we care about losing some
+-- logs if the system crashes? I'm going to go with "no" for now.
 
 -- # Performance
 -- TODO Stream log files with Conduit.
--- TODO Do I need to fsync() in order to not lose data on crash?
 
 -- # Correctness
 -- TODO Write more quickcheck tests.
+-- TODO Use a proper test suite.
 -- TODO Enforce proper use of Content-Type.
 
 -- # Code Quality
@@ -54,6 +56,11 @@ import qualified Filesystem.Path.CurrentOS as P
 import           System.Directory
 import           System.Environment
 import           System.IO
+import           System.IO.Error
+
+import           Data.Attoparsec.ByteString       (Parser)
+import qualified Data.Attoparsec.ByteString       as A
+import qualified Data.Attoparsec.ByteString.Char8 as A8
 
 
 -- Types -----------------------------------------------------------------------
@@ -121,6 +128,10 @@ instance Read LogLevel where
 warn ∷ String → IO ()
 warn = hPutStrLn stderr . ("Warning: " ++)
 
+toMaybe ∷ Either a b → Maybe b
+toMaybe (Left _)  = Nothing
+toMaybe (Right r) = Just r
+
 toEither ∷ a → Maybe b → Either a b
 toEither l Nothing  = Left l
 toEither _ (Just r) = Right r
@@ -141,24 +152,13 @@ enumerated = [minBound .. maxBound]
 -- Lines in Log Files ----------------------------------------------------------
 
 loadLogMsg ∷ ByteString → Maybe LogMsg
-loadLogMsg logLineBS =
-  let logLine = T.decodeUtf8 logLineBS
-      safeIndex t i = if (i < T.length t) && (i >= 0)
-                      then Just $ T.index t i
-                      else Nothing
-
-  in do
-
-    '['      ← safeIndex logLine 0
-    rBracket ← T.findIndex (== ']') logLine
-
-    let logLevelWidth = rBracket - 1
-        (bracketed,msgS) = T.splitAt (rBracket+1) logLine
-        levelS = T.take logLevelWidth $ T.drop 1 bracketed
-
-    level ← safeRead (T.unpack levelS)
-    let msg = mkLogText msgS
-    return $ LogMsg level msg
+loadLogMsg bs = toMaybe $ flip A.parseOnly bs $ do
+  let toText = T.decodeUtf8 . BS.pack
+  A8.char '['
+  Just l ← safeRead . T.unpack . T.decodeUtf8 <$> A8.takeWhile A8.isAlpha_ascii
+  A8.char ']'
+  m ← mkLogText . toText <$> A.many' (A.notWord8 $ fromIntegral $ ord '\n')
+  return $ LogMsg l m
 
 dumpLogMsg ∷ LogMsg → ByteString
 dumpLogMsg (LogMsg level (LogTextInternal msg)) =
