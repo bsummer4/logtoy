@@ -244,21 +244,27 @@ queryLog ∷ P.FilePath → LogLock → ReadQuery → IO [LogMsg]
 queryLog logDir lk (ReadQuery nm levelMay limitMay) = do
   let fp = P.encodeString $ logDir </> logNamePath nm
 
-  allLogData ← withLogLock lk nm $ BS.readFile fp
+  allLogDataE ← tryIOError
+              $ withLogLock lk nm
+              $ BS.readFile fp
 
-  let logLines = BS.split (fromIntegral $ ord '\n') allLogData
-      logMsgs = loadLogMsg <$> logLines
-      onlyMatching = (case limitMay of
-                        Nothing → id
-                        Just limit → take limit)
-                   . (case levelMay of
-                       Nothing → id
-                       Just level → filter (\(LogMsg l _) → l == level))
+  case allLogDataE of
+    Left e | isDoesNotExistError e → return []
+           | otherwise             → ioError e
+    Right allLogData → do
+        let logLines = BS.split (fromIntegral $ ord '\n') allLogData
+            logMsgs = loadLogMsg <$> logLines
+            onlyMatching = (case limitMay of
+                              Nothing → id
+                              Just limit → take limit)
+                         . (case levelMay of
+                             Nothing → id
+                             Just level → filter (\(LogMsg l _) → l == level))
 
-  when (Nothing `L.elem` logMsgs) $
-    warn $ printf "Log file contains an invalid line: %s" fp
+        when (Nothing `L.elem` logMsgs) $
+          warn $ printf "Log file contains an invalid line: %s" fp
 
-  return $ onlyMatching $ catMaybes logMsgs
+        return $ onlyMatching $ catMaybes logMsgs
 
 
 -- Server Stuff ----------------------------------------------------------------
