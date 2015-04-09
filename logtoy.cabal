@@ -16,20 +16,26 @@ executable logtoy
                      , attoparsec
                      , base >=4.7 && <4.8
                      , bytestring
+                     , conduit
+                     , conduit-combinators
+                     , conduit-extra
                      , containers
                      , directory
                      , http-types
                      , QuickCheck
+                     , servant-server
                      , stm
                      , system-filepath
                      , tasty
                      , tasty-hunit
-                     , tasty-smallcheck
                      , tasty-quickcheck
+                     , tasty-smallcheck
                      , text
                      , text-format
+                     , transformers
+                     , unix
+                     , vector
                      , wai
                      , warp
                      , warp-tls
-                     , servant-server
-                     , transformers
+                     , primitive
