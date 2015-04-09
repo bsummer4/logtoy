@@ -22,6 +22,10 @@ executable logtoy
                      , QuickCheck
                      , stm
                      , system-filepath
+                     , tasty
+                     , tasty-hunit
+                     , tasty-smallcheck
+                     , tasty-quickcheck
                      , text
                      , text-format
                      , wai

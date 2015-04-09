@@ -13,7 +13,6 @@
 
 -- # Correctness
 -- TODO Write more quickcheck tests.
--- TODO Use a proper test suite.
 -- TODO Enforce proper use of Content-Type.
 
 -- # Code Quality
@@ -21,12 +20,14 @@
 
 module Main where
 
+import Test.Tasty
+import Test.Tasty.QuickCheck as QC
+import Test.Tasty.HUnit
+
 import Control.Applicative
 import Control.Arrow
 import Control.Monad
 import Data.Monoid
-
-import Test.QuickCheck
 
 import           Data.ByteString      (ByteString)
 import qualified Data.ByteString      as BS
@@ -58,7 +59,6 @@ import           System.Environment
 import           System.IO
 import           System.IO.Error
 
-import           Data.Attoparsec.ByteString       (Parser)
 import qualified Data.Attoparsec.ByteString       as A
 import qualified Data.Attoparsec.ByteString.Char8 as A8
 
@@ -98,13 +98,14 @@ newtype LogLock = LogLockInternal { unLogLock ∷ MVar () }
 mkLogText ∷ Text → LogText
 mkLogText = LogTextInternal . T.filter (/= '\n') . T.strip
 
+validLogNameChar ∷ Char → Bool
+validLogNameChar c = (c == '-') || (isAlphaNum c && not(isUpper c))
+
 -- To simplify pathname construction, we maintain the following invariants:
 --   A `LogNames` must satisfy this regular expression: /^[a-z0-9-]+$/
 --
 -- Upper case characters are not allowed in order to avoid the edge-cases
 -- that are introduced by case-sensitive file systems.
-validLogNameChar c = (c == '-') || (isAlphaNum c && not(isUpper c))
-
 readLogName ∷ Text → Maybe LogName
 readLogName "" = Nothing
 readLogName t = if T.all validLogNameChar t
@@ -154,9 +155,9 @@ enumerated = [minBound .. maxBound]
 loadLogMsg ∷ ByteString → Maybe LogMsg
 loadLogMsg bs = toMaybe $ flip A.parseOnly bs $ do
   let toText = T.decodeUtf8 . BS.pack
-  A8.char '['
+  _ ← A8.char '['
   Just l ← safeRead . T.unpack . T.decodeUtf8 <$> A8.takeWhile A8.isAlpha_ascii
-  A8.char ']'
+  _ ← A8.char ']'
   m ← mkLogText . toText <$> A.many' (A.notWord8 $ fromIntegral $ ord '\n')
   return $ LogMsg l m
 
@@ -165,9 +166,6 @@ dumpLogMsg (LogMsg level (LogTextInternal msg)) =
   T.encodeUtf8 $ LT.toStrict $ case msg of
     "" → T.format "[{}]\n"    (T.Only $ show level)
     _  → T.format "[{}] {}\n" (show level, msg)
-
-prop_reversibleLogSerialization ∷ LogMsg → Bool
-prop_reversibleLogSerialization m = Just m == loadLogMsg (dumpLogMsg m)
 
 
 -- Locking Files ---------------------------------------------------------------
@@ -178,29 +176,6 @@ withLogLock ∷ LogLock → LogName → IO a → IO a
 withLogLock lock _ action =
   withMVar (unLogLock lock) (\() → action)
 
-
--- Arbitrary Instances ---------------------------------------------------------
-
-instance Arbitrary LogMsg where
-  arbitrary = LogMsg <$> arbitrary <*> arbitrary
-
-instance Arbitrary LogText where
-  arbitrary = mkLogText <$> arbitrary
-
-instance Arbitrary LogLevel where
-  arbitrary = do
-    -- XXX Icky. Can I use `toEnum`?
-    let levels = enumerated
-    i ← (`mod` length levels) <$> arbitrary
-    return $ levels !! i
-
-instance Arbitrary Text where
-  arbitrary = T.pack <$> arbitrary
-
-instance Arbitrary LogName where
-  arbitrary = do
-    r ← T.filter validLogNameChar <$> arbitrary
-    return $ fromMaybe (LogNameInternal "a") $ readLogName r
 
 -- JSON Instances --------------------------------------------------------------
 
@@ -341,10 +316,45 @@ apiServer lk logDir req respond = do
       respond $ okResp $ J.encode $ Log nm <$> logs
 
 
--- Program Entry Points --------------------------------------------------------
+-- Testing ---------------------------------------------------------------------
+
+instance Arbitrary LogMsg where
+  arbitrary = LogMsg <$> arbitrary <*> arbitrary
+
+instance Arbitrary LogText where
+  arbitrary = mkLogText <$> arbitrary
+
+instance Arbitrary LogLevel where
+  arbitrary = do
+    -- XXX Icky. Can I use `toEnum`?
+    let levels = enumerated
+    i ← (`mod` length levels) <$> arbitrary
+    return $ levels !! i
+
+instance Arbitrary Text where
+  arbitrary = T.pack <$> arbitrary
+
+instance Arbitrary LogName where
+  arbitrary = do
+    r ← T.filter validLogNameChar <$> arbitrary
+    return $ fromMaybe (LogNameInternal "a") $ readLogName r
 
 test ∷ IO ()
-test = quickCheck prop_reversibleLogSerialization
+test = defaultMain $ testGroup "tests"
+  [ testGroup "Log dumping/parsing"
+      [ QC.testProperty "Just == loadLogMsg . dumpLogMsg" $
+          \m → Just m == loadLogMsg (dumpLogMsg m)
+      , testCase "dumpLogMsg" $
+          dumpLogMsg (LogMsg Info (mkLogText "foo"))   @?= "[Info] foo\n"
+      , testCase "dumpLogMsg on empty message" $
+          dumpLogMsg (LogMsg Error (mkLogText ""))     @?= "[Error]\n"
+      , testCase "Log messages are trimmed" $
+          dumpLogMsg (LogMsg Warn (mkLogText " foo ")) @?= "[Warn] foo\n"
+      ]
+  ]
+
+
+-- Entry Point -----------------------------------------------------------------
 
 main ∷ IO ()
 main = do
