@@ -31,3 +31,5 @@ executable logtoy
                      , wai
                      , warp
                      , warp-tls
+                     , servant-server
+                     , transformers

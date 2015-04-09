@@ -1,5 +1,6 @@
-{-# LANGUAGE LambdaCase, OverloadedStrings, ScopedTypeVariables #-}
-{-# LANGUAGE UnicodeSyntax                                      #-}
+{-# LANGUAGE DataKinds, DeriveGeneric, FlexibleInstances, LambdaCase #-}
+{-# LANGUAGE OverloadedStrings, PolyKinds, ScopedTypeVariables       #-}
+{-# LANGUAGE TypeFamilies, TypeOperators, UnicodeSyntax              #-}
 
 -- Handling of IOErrors probably deserves more attention, however warp
 -- seems to do the right thing when it encounters unexpected IO errors. It
@@ -8,37 +9,35 @@
 -- `fsync()` might be worth consideration. Do we care about losing some
 -- logs if the system crashes? I'm going to go with "no" for now.
 
--- # Performance
+-- `servent` ignores invalid query parameters.  For example, making
+-- a request to '/read/test?level=warnn' returns all of the logs in
+-- tests. This is pretty questionable! However, I'm going to keep this
+-- behavior for now to simplify my code.
+
+-- TODO Return the last n items, not the first n.
+-- TODO For `?level=` return all levels at OR ABOVE this level.
 -- TODO Stream log files with Conduit.
-
--- # Correctness
--- TODO Write more quickcheck tests.
--- TODO Enforce proper use of Content-Type.
-
--- # Code Quality
--- The request decoding code is super ugly.
+-- TODO Write more tests.
+-- TODO queryLog is ugly.
 
 module Main where
 
 import Test.Tasty
-import Test.Tasty.QuickCheck as QC
 import Test.Tasty.HUnit
+import Test.Tasty.QuickCheck as QC
 
 import Control.Applicative
-import Control.Arrow
 import Control.Monad
-import Data.Monoid
 
-import           Data.ByteString      (ByteString)
-import qualified Data.ByteString      as BS
-import qualified Data.ByteString.Lazy as LBS
+import           Data.ByteString    (ByteString)
+import qualified Data.ByteString    as BS
 import           Data.Char
 import           Data.Maybe
-import           Data.Text            (Text)
-import qualified Data.Text            as T
-import qualified Data.Text.Encoding   as T
-import qualified Data.Text.Format     as T
-import qualified Data.Text.Lazy       as LT
+import           Data.Text          (Text)
+import qualified Data.Text          as T
+import qualified Data.Text.Encoding as T
+import qualified Data.Text.Format   as T
+import qualified Data.Text.Lazy     as LT
 import           Text.Printf
 
 import Control.Concurrent.MVar
@@ -48,7 +47,6 @@ import qualified Data.List as L
 import           Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as J
 
-import qualified Network.HTTP.Types       as W
 import qualified Network.Wai              as W
 import qualified Network.Wai.Handler.Warp as W
 
@@ -61,6 +59,10 @@ import           System.IO.Error
 
 import qualified Data.Attoparsec.ByteString       as A
 import qualified Data.Attoparsec.ByteString.Char8 as A8
+
+import Control.Monad.IO.Class
+import Data.Proxy
+import Servant
 
 
 -- Types -----------------------------------------------------------------------
@@ -115,13 +117,16 @@ readLogName t = if T.all validLogNameChar t
 logNamePath ∷ LogName → P.FilePath
 logNamePath (LogNameInternal i) = P.fromText i
 
-instance Read LogLevel where
-  readsPrec _ s = case toLower <$> s of
-    "debug" → [(Debug,"")]
-    "info"  → [(Info,"")]
-    "warn"  → [(Warn,"")]
-    "error" → [(Error,"")]
-    _       → []
+instance FromText LogLevel where
+  fromText s = case T.toLower s of
+    "debug" → Just Debug
+    "info"  → Just Info
+    "warn"  → Just Warn
+    "error" → Just Error
+    _       → Nothing
+
+instance FromText LogName where
+  fromText = readLogName
 
 
 -- Utilities -------------------------------------------------------------------
@@ -154,11 +159,11 @@ enumerated = [minBound .. maxBound]
 
 loadLogMsg ∷ ByteString → Maybe LogMsg
 loadLogMsg bs = toMaybe $ flip A.parseOnly bs $ do
-  let toText = T.decodeUtf8 . BS.pack
+  let strToText = T.decodeUtf8 . BS.pack
   _ ← A8.char '['
-  Just l ← safeRead . T.unpack . T.decodeUtf8 <$> A8.takeWhile A8.isAlpha_ascii
+  Just l ← fromText . T.decodeUtf8 <$> A8.takeWhile A8.isAlpha_ascii
   _ ← A8.char ']'
-  m ← mkLogText . toText <$> A.many' (A.notWord8 $ fromIntegral $ ord '\n')
+  m ← mkLogText . strToText <$> A.many' (A.notWord8 $ fromIntegral $ ord '\n')
   return $ LogMsg l m
 
 dumpLogMsg ∷ LogMsg → ByteString
@@ -170,8 +175,8 @@ dumpLogMsg (LogMsg level (LogTextInternal msg)) =
 
 -- Locking Files ---------------------------------------------------------------
 
--- This is over-engineered, but I'm hoping it will help when I move away
--- from one-big-lock.
+-- This is over-engineered. I was planning to have one lock per file,
+-- but decided that it wasn't worth it since performance is not a goal.
 withLogLock ∷ LogLock → LogName → IO a → IO a
 withLogLock lock _ action =
   withMVar (unLogLock lock) (\() → action)
@@ -185,7 +190,7 @@ instance J.FromJSON LogText where
 
 instance J.FromJSON LogLevel where
   parseJSON (J.String s) = fromMaybe (fail "Invalid log level") $
-                             return <$> safeRead (T.unpack s)
+                             return <$> fromText s
   parseJSON _            = fail "Expected a string for the log level"
 
 instance J.FromJSON Log where
@@ -207,16 +212,16 @@ instance J.ToJSON Log where
 
 -- Log File IO -----------------------------------------------------------------
 
-appendLog ∷ P.FilePath → LogLock → Log → IO ()
-appendLog logDir lk (Log n m) =
+appendLog ∷ (LogLock,P.FilePath) → Log → IO ()
+appendLog (lk,logDir) (Log n m) =
   let fp = logDir </> logNamePath n
       msg = dumpLogMsg m
   in withLogLock lk n $ do
        createDirectoryIfMissing True $ P.encodeString logDir
        BS.appendFile (P.encodeString fp) msg
 
-queryLog ∷ P.FilePath → LogLock → ReadQuery → IO [LogMsg]
-queryLog logDir lk (ReadQuery nm levelMay limitMay) = do
+queryLog ∷ (LogLock,P.FilePath) → ReadQuery → IO [LogMsg]
+queryLog (lk,logDir) (ReadQuery nm levelMay limitMay) = do
   let fp = P.encodeString $ logDir </> logNamePath nm
 
   allLogDataE ← tryIOError
@@ -244,76 +249,21 @@ queryLog logDir lk (ReadQuery nm levelMay limitMay) = do
 
 -- Server Stuff ----------------------------------------------------------------
 
-getQueryParam ∷ Text → W.Query → Maybe Text
-getQueryParam paramKey query = join $ cvt <$> L.find matches query
+type Api = "read" :> Capture "logname" LogName
+                  :> QueryParam "limit" Int
+                  :> QueryParam "level" LogLevel
+                  :> Get [Log]
+      :<|> "log" :> ReqBody Log
+                 :> Post Log
 
-  where keyBS = T.encodeUtf8 paramKey
+apiServer ∷ (LogLock,P.FilePath) → W.Application
+apiServer config = serve (Proxy∷Proxy Api) $ readH :<|> logH
+  where readH nm limit level = liftIO $
+          map (Log nm) <$> queryLog config (ReadQuery nm level limit)
 
-        matches ∷ W.QueryItem → Bool
-        matches (bsK,Just _) = bsK == keyBS
-        matches _            = False
-
-        cvt ∷ W.QueryItem → Maybe Text
-        cvt (_,valueBS) = T.decodeUtf8 <$> valueBS
-
-decodeRequest ∷ W.Request → ByteString → Either ReqError Req
-decodeRequest req body =
-  let
-    decodeLog ∷ Either ReqError Log
-    decodeLog = left (InvalidBody . T.pack) $
-                  J.eitherDecodeStrict' body
-
-    pages ∷ Either ReqError (Maybe Int)
-    pages = case getQueryParam "lines" (W.queryString req) of
-      Just s  → case safeRead(T.unpack s) of
-                  Nothing → Left InvalidQueryParam
-                  Just x →  Right $ Just x
-      Nothing → Right Nothing
-
-    level ∷ Either ReqError (Maybe LogLevel)
-    level = case getQueryParam "level" $ W.queryString req of
-      Just s  → case safeRead (T.unpack s) of
-                  Nothing → Left InvalidQueryParam
-                  Just x  → Right $ Just x
-      Nothing → Right Nothing
-
-  in case W.pathInfo req of
-    ["log"]          → LogReq <$> decodeLog
-    ["read",logname] → case readLogName logname of
-      Nothing → Left InvalidEndpoint
-      Just nm → ReadReq <$> (ReadQuery nm <$> level <*> pages)
-    _                → Left InvalidEndpoint
-
-apiServer ∷ LogLock
-          → P.FilePath
-          → W.Request
-          → (W.Response → IO W.ResponseReceived)
-          → IO W.ResponseReceived
-apiServer lk logDir req respond = do
-  body ← LBS.toStrict <$> W.strictRequestBody req
-
-  let okResp =  W.responseLBS W.status200 []
-      failResp =  W.responseLBS W.status400 []
-
-  case decodeRequest req body of
-    Left InvalidEndpoint →
-      respond $ W.responseLBS W.status400 [] "Invalid endpoint"
-
-    Left InvalidQueryParam →
-      respond $ W.responseLBS W.status400 [] "Invalid query parameter"
-
-    Left (InvalidBody errMsg) →
-      respond $ failResp msg
-        where msg = "Couldn't parse request body: "
-                 <> LBS.fromStrict(T.encodeUtf8 errMsg)
-
-    Right (LogReq l) → do
-      appendLog logDir lk l
-      respond $ okResp $ LBS.fromStrict $ T.encodeUtf8 "{result: ok}"
-
-    Right (ReadReq r@(ReadQuery nm _ _)) → do
-      logs ← queryLog logDir lk r
-      respond $ okResp $ J.encode $ Log nm <$> logs
+        logH entry = do
+          _ ← liftIO $ appendLog config entry
+          return entry
 
 
 -- Testing ---------------------------------------------------------------------
@@ -322,7 +272,7 @@ instance Arbitrary LogMsg where
   arbitrary = LogMsg <$> arbitrary <*> arbitrary
 
 instance Arbitrary LogText where
-  arbitrary = mkLogText <$> arbitrary
+  arbitrary = mkLogText . T.pack <$> arbitrary
 
 instance Arbitrary LogLevel where
   arbitrary = do
@@ -331,12 +281,9 @@ instance Arbitrary LogLevel where
     i ← (`mod` length levels) <$> arbitrary
     return $ levels !! i
 
-instance Arbitrary Text where
-  arbitrary = T.pack <$> arbitrary
-
 instance Arbitrary LogName where
   arbitrary = do
-    r ← T.filter validLogNameChar <$> arbitrary
+    r ← T.filter validLogNameChar . T.pack <$> arbitrary
     return $ fromMaybe (LogNameInternal "a") $ readLogName r
 
 test ∷ IO ()
@@ -372,4 +319,4 @@ main = do
         where badPort = error $ printf "Invalid port number: %s" portS
 
   lk ← LogLockInternal <$> newMVar ()
-  W.run port $ apiServer lk logDir
+  W.run port $ apiServer (lk,logDir)
