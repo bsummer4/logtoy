@@ -9,20 +9,18 @@
 -- `fsync()` might be worth consideration. Do we care about losing some
 -- logs if the system crashes? I'm going to go with "no" for now.
 
--- `servent` ignores invalid query parameters.  For example, making
+-- `servant` ignores invalid query parameters.  For example, making
 -- a request to '/read/test?level=warnn' returns all of the logs in
 -- tests. This is pretty questionable! However, I'm going to keep this
 -- behavior for now to simplify my code.
 
--- TODO Write more tests.
--- TODO My Conduit code is ugly.
--- TODO Is it worthwhile to stream the output directly to the response?
---        How much work would this be?
+-- TODO Stream JSON text directly to the WAI response using `responseStream`.
+-- TODO Look into reading the log file back-to-front. The current approach
+--      will not scale to larger log files.
 
 module Main where
 
 import Control.Applicative
-import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Primitive
 import Control.Monad.ST
@@ -35,7 +33,6 @@ import qualified Data.Attoparsec.ByteString.Char8 as A8
 import           Data.ByteString                  (ByteString)
 import qualified Data.ByteString                  as BS
 import           Data.Char
-import qualified Data.List                        as L
 import           Data.Maybe
 import           Data.Text                        (Text)
 import qualified Data.Text                        as T
@@ -174,34 +171,41 @@ sinkVecLastN ∷ (MonadBase base m, V.Vector v a, PrimMonad base)
                 → Consumer a m (v a)
 sinkVecLastN maxSize | maxSize <= 0 = return V.empty
 sinkVecLastN maxSize                = do
-  mv <- liftBase $ VM.new maxSize
-  let go n = do
-          let i = n `mod` maxSize
-          mx <- await
-          case mx of
-              Nothing -> do
-                let frozen = liftBase (V.unsafeFreeze mv)
-                if n < maxSize then V.slice 0 i <$> frozen
-                               else rotateL i <$> frozen
-              Just x -> do
-                  liftBase $ VM.write mv i x
-                  go (n + 1)
-  go 0
+    mv <- liftBase $ VM.new maxSize
+    let go n = do
+            let i = n `mod` maxSize
+            mx <- await
+            case mx of
+                Nothing -> do
+                    let frozen = liftBase (V.unsafeFreeze mv)
+                    if n < maxSize then V.slice 0 i <$> frozen
+                                   else rotateL i <$> frozen
+                Just x -> do
+                    liftBase $ VM.write mv i x
+                    go (n + 1)
+    go 0
+
+lastNC ∷ (MonadBase base m, PrimMonad base) => Int → Conduit a m a
+lastNC n = sinkVecLastN n >>= BV.mapM_ yield
 
 lastN ∷ Int → [a] → [a]
-lastN n xs =
-  BV.toList $ runST $ C.runConduit $ C.sourceList xs $$ sinkVecLastN n
+lastN n xs = runST $ C.runConduit $ C.sourceList xs $= lastNC n $$ sinkList
+
+fuseMaybe ∷ Monad m => Conduit a m b → Maybe (Conduit b m b) → Conduit a m b
+fuseMaybe source Nothing  = source
+fuseMaybe source (Just c) = source $= c
+
 
 -- Lines in Log Files ----------------------------------------------------------
 
 readLogMsg ∷ ByteString → Maybe LogMsg
 readLogMsg bs = toMaybe $ flip A.parseOnly bs $ do
-  let strToText = T.decodeUtf8 . BS.pack
-  _ ← A8.char '['
-  Just l ← fromText . T.decodeUtf8 <$> A8.takeWhile A8.isAlpha_ascii
-  _ ← A8.char ']'
-  m ← mkLogText . strToText <$> A.many' (A.notWord8 $ fromIntegral $ ord '\n')
-  return $ LogMsg l m
+    let strToText = T.decodeUtf8 . BS.pack
+    _ ← A8.char '['
+    Just l ← fromText . T.decodeUtf8 <$> A8.takeWhile A8.isAlpha_ascii
+    _ ← A8.char ']'
+    m ← mkLogText . strToText <$> A.many' (A.notWord8 $ fromIntegral $ ord '\n')
+    return $ LogMsg l m
 
 showLogMsg ∷ LogMsg → ByteString
 showLogMsg (LogMsg level (LogTextInternal msg)) =
@@ -254,8 +258,8 @@ appendLog (lk,logDir) (Log n m) =
   let fp = logDir </> logNamePath n
       msg = showLogMsg m
   in withLogLock lk n $ do
-       createDirectoryIfMissing True $ P.encodeString logDir
-       BS.appendFile (P.encodeString fp) msg
+         createDirectoryIfMissing True $ P.encodeString logDir
+         BS.appendFile (P.encodeString fp) msg
 
 -- Here, we rely on the fact that our IO files are append-only to keep the
 -- lock duraction very short. We use the lock to grab the size of the
@@ -266,33 +270,26 @@ logFile ∷ MonadResource m => (LogLock,P.FilePath) →
                              LogName →
                              IO (Source m ByteString)
 logFile (lk,logDir) nm = do
-  let fp = P.encodeString $ logDir </> logNamePath nm
+    let fp = P.encodeString $ logDir </> logNamePath nm
+    filesizeE ← withLogLock lk nm
+              $ tryIOError
+              $ fromIntegral . fileSize <$> getFileStatus fp
+    case filesizeE of
+      Left e | isDoesNotExistError e → return C.sourceNull
+             | otherwise             → ioError e
+      Right sz                       → return $ CB.sourceFile fp $= takeCE sz
 
-  filesizeE ← withLogLock lk nm
-            $ tryIOError
-            $ fromIntegral . fileSize <$> getFileStatus fp
-
-  case filesizeE of
-    Left e | isDoesNotExistError e → return C.sourceNull
-           | otherwise             → ioError e
-    Right sz                       → return $ CB.sourceFile fp $= takeCE sz
-
-toLogs ∷ Monad m => LogName → Conduit ByteString m Log
-toLogs nm = CB.lines $= C.mapMaybe (fmap (Log nm) . readLogMsg)
-
-levelGE ∷ Monad m => LogLevel → Conduit Log m Log
-levelGE minLevel = filterC $ \log → logLevel l >= minLevel
+logLevelGE ∷ Monad m => LogLevel → Conduit Log m Log
+logLevelGE minLevel = filterC $ \l → logLevel l >= minLevel
   where logLevel (Log _ (LogMsg l _)) = l
 
-queryLog ∷ (LogLock,P.FilePath) → ReadQuery → IO [Log]
-queryLog config (ReadQuery nm levelMay limitMay) = do
-  src ← logFile config nm
-  let logs = src $= toLogs nm
-  let filteredLogs = case levelMay of Nothing → logs
-                                      Just l → logs $= levelGE l
-  let limitedLogs = case limitMay of Nothing → filteredLogs $$ sinkVector
-                                     Just n → filteredLogs $$ sinkVecLastN n
-  BV.toList <$> runResourceT (C.runConduit limitedLogs)
+queryLogs ∷ (MonadBase base m,PrimMonad base)
+          ⇒ ReadQuery
+          → Conduit ByteString m Log
+queryLogs (ReadQuery nm levelMay limitMay) =
+  CB.lines $= C.mapMaybe (fmap (Log nm) . readLogMsg)
+    `fuseMaybe` (logLevelGE <$> levelMay)
+    `fuseMaybe` (lastNC     <$> limitMay)
 
 
 -- Server Stuff ----------------------------------------------------------------
@@ -306,12 +303,14 @@ type Api = "read" :> Capture "logname" LogName
 
 apiServer ∷ (LogLock,P.FilePath) → W.Application
 apiServer config = serve (Proxy∷Proxy Api) $ readH :<|> logH
-  where readH nm limit level = liftIO $
-          queryLog config (ReadQuery nm level limit)
+  where readH nm limit level = liftIO $ do
+            bytes ← logFile config nm
+            let q = ReadQuery nm level limit
+            runResourceT $ C.runConduit $ bytes $= queryLogs q $$ sinkList
 
         logH entry = do
-          _ ← liftIO $ appendLog config entry
-          return entry
+            _ ← liftIO $ appendLog config entry
+            return entry
 
 
 -- Testing ---------------------------------------------------------------------
@@ -324,15 +323,14 @@ instance Arbitrary LogText where
 
 instance Arbitrary LogLevel where
   arbitrary = do
-    -- XXX Icky. Can I use `toEnum`?
-    let levels = enumerated
-    i ← (`mod` length levels) <$> arbitrary
-    return $ levels !! i
+      let levels = enumerated
+      i ← (`mod` length levels) <$> arbitrary
+      return $ levels !! i
 
 instance Arbitrary LogName where
   arbitrary = do
-    r ← T.filter validLogNameChar . T.pack <$> arbitrary
-    return $ fromMaybe (LogNameInternal "a") $ readLogName r
+      r ← T.filter validLogNameChar . T.pack <$> arbitrary
+      return $ fromMaybe (LogNameInternal "a") $ readLogName r
 
 test ∷ IO ()
 test = defaultMain $ testGroup "tests"
@@ -359,18 +357,18 @@ test = defaultMain $ testGroup "tests"
 
 main ∷ IO ()
 main = do
-  progName ← getProgName
-  args ← getArgs
-  wd ← P.decodeString <$> getCurrentDirectory
-  portS ← fromMaybe "8080" <$> lookupEnv "PORT"
+    progName ← getProgName
+    args ← getArgs
+    wd ← P.decodeString <$> getCurrentDirectory
+    portS ← fromMaybe "8080" <$> lookupEnv "PORT"
 
-  let logDir = mkAbsolute wd $ case args of
-        [d] → P.decodeString d
-        []  → "./logs"
-        _   → error $ printf "usage: %s [logdir]" progName
+    let logDir = mkAbsolute wd $ case args of
+          [d] → P.decodeString d
+          []  → "./logs"
+          _   → error $ printf "usage: %s [logdir]" progName
 
-  let port∷Int = fromMaybe badPort $ safeRead portS
-        where badPort = error $ printf "Invalid port number: %s" portS
+    let port∷Int = fromMaybe badPort $ safeRead portS
+          where badPort = error $ printf "Invalid port number: %s" portS
 
-  lk ← LogLockInternal <$> newMVar ()
-  W.run port $ apiServer (lk,logDir)
+    lk ← LogLockInternal <$> newMVar ()
+    W.run port $ apiServer (lk,logDir)
