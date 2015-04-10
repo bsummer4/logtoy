@@ -14,7 +14,6 @@
 -- tests. This is pretty questionable! However, I'm going to keep this
 -- behavior for now to simplify my code.
 
--- TODO For `?level=` return all levels at OR ABOVE this level.
 -- TODO Write more tests.
 -- TODO My Conduit code is ugly.
 -- TODO Is it worthwhile to stream the output directly to the response?
@@ -83,7 +82,7 @@ newtype LogText = LogTextInternal { unLogText ∷ Text }
 newtype LogName = LogNameInternal { unLogName ∷ Text }
 
 data LogLevel = Debug | Info | Warn | Error
-  deriving (Show,Eq,Enum,Bounded)
+  deriving (Show,Eq,Ord,Enum,Bounded)
 
 data LogMsg = LogMsg LogLevel LogText
   deriving (Eq,Show)
@@ -279,10 +278,11 @@ logFile (lk,logDir) nm = do
     Right sz                       → return $ CB.sourceFile fp $= takeCE sz
 
 toLogs ∷ Monad m => LogName → Conduit ByteString m Log
-toLogs nm = CB.lines $= C.mapMaybe ((Log nm <$>) . readLogMsg)
+toLogs nm = CB.lines $= C.mapMaybe (fmap (Log nm) . readLogMsg)
 
 levelGE ∷ Monad m => LogLevel → Conduit Log m Log
-levelGE level = filterC (\(Log _ (LogMsg l _)) → l == level)
+levelGE minLevel = filterC $ \log → logLevel l >= minLevel
+  where logLevel (Log _ (LogMsg l _)) = l
 
 queryLog ∷ (LogLock,P.FilePath) → ReadQuery → IO [Log]
 queryLog config (ReadQuery nm levelMay limitMay) = do
@@ -350,6 +350,9 @@ test = defaultMain $ testGroup "tests"
   , QC.testProperty "lastN == (\n → reverse . take n . reverse)" $
        \n (l∷[Int]) → let len = n `mod` 100000
                       in reverse (take len $ reverse l) == lastN len l
+
+  , testCase "LogLevel ordering" $
+      Debug<Info && Info<Warn && Warn<Error @?= True
   ]
 
 -- Entry Point -----------------------------------------------------------------
