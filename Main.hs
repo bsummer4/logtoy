@@ -14,6 +14,9 @@
 -- tests. This is pretty questionable! However, I'm going to keep this
 -- behavior for now to simplify my code.
 
+-- TODO Limit the size of `limit` at the API level, since we have to
+--      allocate a vector of that size.
+-- TODO Return `[]` when the file for a LogName doesn't exist.
 -- TODO `servant` sends shitty response texts when there's an exception.
 --      Handle them manually.
 -- TODO Stream JSON text directly to the WAI response using `responseStream`.
@@ -23,7 +26,7 @@
 module Main (main,test) where
 
 import Control.Applicative
-import Control.Monad.IO.Class
+import Control.Monad
 import Control.Monad.Primitive
 import Control.Monad.ST
 import Data.Proxy
@@ -62,7 +65,7 @@ import           Filesystem.Path.CurrentOS ((</>))
 import qualified Filesystem.Path.CurrentOS as P
 import           System.Directory
 import           System.Environment
-import           System.IO.Error
+import           System.IO
 import           System.Posix.Files
 
 import Test.Tasty
@@ -70,6 +73,8 @@ import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck as QC
 
 import Servant
+
+import Data.Monoid
 
 
 -- Types -----------------------------------------------------------------------
@@ -213,22 +218,24 @@ withLogLock lock _ action =
 -- JSON Instances --------------------------------------------------------------
 
 instance J.FromJSON LogText where
-  parseJSON (J.String s) = return $ mkLogText s
-  parseJSON _            = fail "Expected a string for the log text"
+  parseJSON = J.withText "log text" $ \s →
+                return $ mkLogText s
 
 instance J.FromJSON LogLevel where
-  parseJSON (J.String s) = fromMaybe (fail "Invalid log level") $
-                             return <$> fromText s
-  parseJSON _            = fail "Expected a string for the log level"
+  parseJSON = J.withText "log level" $ \s →
+                fromMaybe (fail "Invalid log level") $
+                  return <$> fromText s
+
+instance J.FromJSON LogName where
+  parseJSON = J.withText "log name" $ \s → do
+                fromMaybe (fail ("Invalid log name: " <> T.unpack s)) $
+                 return <$> readLogName s
 
 instance J.FromJSON Log where
-  parseJSON (J.Object v) = do logNameMay ← readLogName <$> v .: "name"
-                              case logNameMay of
-                                Nothing → fail "Invalid log name"
-                                Just nm → Log nm <$>
-                                            (LogMsg <$> v .: "level"
-                                                    <*> v .: "msg")
-  parseJSON _            = fail "Expected an object for the log"
+  parseJSON = J.withObject "log" $ \v → do
+                Log <$> v .: "name"
+                    <*> (LogMsg <$> v .: "level"
+                                <*> v .: "msg")
 
 instance J.ToJSON Log where
   toJSON (Log n (LogMsg level msg)) =
@@ -240,33 +247,16 @@ instance J.ToJSON Log where
 
 -- Log File IO -----------------------------------------------------------------
 
--- If we don't have permissions to read a file, getFileStatus tells us
--- that the file size is zero. This is annoying, because it
--- `CB.sourceFile` wont open the file if we ask for zero bytes from
--- it. This causes permission errors to go unreported.
---
--- Since we want an exception to be thrown when we try to read from
--- files that we don't have permissions for, we return 1 instead. This is
--- NOT a good solution, and needs to be cleaned up.
-getLogFileSize ∷ (LogLock,P.FilePath) → LogName → IO (Maybe Int)
+getLogFileSize ∷ (LogLock,P.FilePath) → LogName → IO Int
 getLogFileSize (lk,logDir) nm = do
     let fp = P.encodeString $ logDir </> logNamePath nm
-    filesizeE ← withLogLock lk nm
-              $ tryIOError
-              $ fromIntegral . fileSize <$> getFileStatus fp
-    case filesizeE of
-      Left e | isDoesNotExistError e → return Nothing
-      Left e | otherwise             → ioError e
-      Right 0                        → return $ Just 1 -- TODO HACK
-      Right sz                       → return $ Just sz
+    withLogLock lk nm $ fromIntegral . fileSize <$> getFileStatus fp
 
 logLevelGE ∷ Monad m => LogLevel → Conduit Log m Log
 logLevelGE minLevel = filterC $ \l → logLevel l >= minLevel
   where logLevel (Log _ (LogMsg l _)) = l
 
-queryLogs ∷ (MonadBase base m,PrimMonad base)
-          ⇒ ReadQuery
-          → Conduit ByteString m Log
+queryLogs ∷ (MonadBase b m,PrimMonad b) => ReadQuery → Conduit ByteString m Log
 queryLogs (ReadQuery nm levelMay limitMay) =
   CB.lines $= C.mapMaybe (fmap (Log nm) . readLogMsg)
     `fuseMaybe` (logLevelGE <$> levelMay)
@@ -282,31 +272,38 @@ type Api = "read" :> Capture "logname" LogName
       :<|> "log" :> ReqBody Log
                  :> Post Log
 
+-- Here, we rely on the fact that our IO files are append-only to keep
+-- the lock duraction very short. We use the lock only to grab the size of
+-- the file, and then we stream the first n bytes of the file. This way,
+-- even if the end of the file goes into an inconsistent state while we
+-- are reading, this doesn't affect us.
+--
+-- HACK ALERT: The `hGetChar` bit forces an exception to be thrown when
+-- we don't have permissions to read a file. Otherwise, filesize will be
+-- reported as zero, and then (CE.sourceFile) will never be asked for
+-- any data, and wont ever try to read the file.
+getLogs :: MonadIO m =>
+           (LogLock,P.FilePath) → LogName → Maybe Int → Maybe LogLevel → m [Log]
+getLogs (lk,logDir) nm limit level = liftIO $ do
+    let fp = P.encodeString (logDir </> logNamePath nm)
+    sz ← getLogFileSize (lk,logDir) nm
+    when (sz == 0) $ withFile fp ReadMode (void . hGetChar)
+    let q = ReadQuery nm level limit
+    runResourceT $ C.runConduit $
+      CB.sourceFile fp $= takeCE sz $= queryLogs q $$ sinkList
+
+appendLog ∷ MonadIO m => (LogLock, P.FilePath) → Log → m Log
+appendLog (lk,logDir) entry@(Log nm m) = liftIO $
+    let fp = P.encodeString (logDir </> logNamePath nm)
+    in do withLogLock lk nm $ do
+              createDirectoryIfMissing True $ P.encodeString logDir
+              BS.appendFile fp (showLogMsg m)
+          return entry
+
 apiServer ∷ (LogLock,P.FilePath) → W.Application
-apiServer config@(lk,logDir) = serve (Proxy∷Proxy Api) $ readH :<|> logH
-
-  where readH nm limit level = liftIO $ do
-            -- Here, we rely on the fact that our IO files are append-only
-            -- to keep the lock duraction very short. We use the lock only to
-            -- grab the size of the file, and then we stream the first n
-            -- bytes of the file. This way, even if the end of the file goes
-            -- into an inconsistent state while we are reading, this doesn't
-            -- affect us.
-            szM ← getLogFileSize config nm
-            let fp = P.encodeString (logDir </> logNamePath nm)
-            case szM of
-              Nothing → return []
-              Just sz → do
-                let q = ReadQuery nm level limit
-                runResourceT $ C.runConduit $
-                  CB.sourceFile fp $= takeCE sz $= queryLogs q $$ sinkList
-
-        logH entry@(Log nm m) = liftIO $
-            let fp = P.encodeString (logDir </> logNamePath nm)
-            in do withLogLock lk nm $ do
-                      createDirectoryIfMissing True $ P.encodeString logDir
-                      BS.appendFile fp (showLogMsg m)
-                  return entry
+apiServer config = serve (Proxy∷Proxy Api) (readH :<|> logH)
+  where readH = getLogs config
+        logH  = appendLog config
 
 
 -- Testing ---------------------------------------------------------------------
@@ -330,18 +327,22 @@ instance Arbitrary LogName where
 
 test ∷ IO ()
 test = defaultMain $ testGroup "tests"
-  [ testGroup "Log dumping/parsing"
-      [ QC.testProperty "Just == readLogMsg . showLogMsg" $
-          \m → Just m == readLogMsg (showLogMsg m)
-      , testCase "showLogMsg" $
-          showLogMsg (LogMsg Info (mkLogText "foo"))   @?= "[Info] foo\n"
-      , testCase "showLogMsg on empty message" $
-          showLogMsg (LogMsg Error (mkLogText ""))     @?= "[Error]\n"
-      , testCase "Log messages are trimmed" $
-          showLogMsg (LogMsg Warn (mkLogText " foo ")) @?= "[Warn] foo\n"
-      ]
+  [ QC.testProperty "Just == readLogMsg . showLogMsg" $
+      \m → Just m == readLogMsg (showLogMsg m)
 
-  , QC.testProperty "lastN == (\n → reverse . take n . reverse)" $
+  , testCase "showLogMsg" $
+      showLogMsg (LogMsg Info (mkLogText "foo"))   @?= "[Info] foo\n"
+
+  , testCase "showLogMsg on empty message" $
+      showLogMsg (LogMsg Error (mkLogText ""))     @?= "[Error]\n"
+
+  , testCase "Log messages are trimmed" $
+      showLogMsg (LogMsg Warn (mkLogText " foo ")) @?= "[Warn] foo\n"
+
+  , testCase "Log messages can't contain newlines" $
+      showLogMsg (LogMsg Debug (mkLogText "fo\no")) @?= "[Debug] foo\n"
+
+  , QC.testProperty "lastN == (\\n → reverse . take n . reverse)" $
        \n (l∷[Int]) → let len = n `mod` 100000
                       in reverse (take len $ reverse l) == lastN len l
 
