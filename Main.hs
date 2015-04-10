@@ -14,11 +14,11 @@
 -- tests. This is pretty questionable! However, I'm going to keep this
 -- behavior for now to simplify my code.
 
--- TODO Return the last n items, not the first n.
 -- TODO For `?level=` return all levels at OR ABOVE this level.
--- TODO Stream log files with Conduit.
 -- TODO Write more tests.
--- TODO queryLog is ugly.
+-- TODO My Conduit code is ugly.
+-- TODO Is it worthwhile to stream the output directly to the response?
+--        How much work would this be?
 
 module Main where
 
@@ -278,34 +278,21 @@ logFile (lk,logDir) nm = do
            | otherwise             → ioError e
     Right sz                       → return $ CB.sourceFile fp $= takeCE sz
 
-toLogs ∷ Monad m => LogName → Conduit a m ByteString → ConduitM a Log m ()
-toLogs nm bytes = bytes $= CB.lines $= C.mapMaybe ((Log nm <$>) . readLogMsg)
+toLogs ∷ Monad m => LogName → Conduit ByteString m Log
+toLogs nm = CB.lines $= C.mapMaybe ((Log nm <$>) . readLogMsg)
 
-queryLog ∷ (LogLock,P.FilePath) → ReadQuery → IO [LogMsg]
-queryLog (lk,logDir) (ReadQuery nm levelMay limitMay) = do
-  let fp = P.encodeString $ logDir </> logNamePath nm
+levelGE ∷ Monad m => LogLevel → Conduit Log m Log
+levelGE level = filterC (\(Log _ (LogMsg l _)) → l == level)
 
-  allLogDataE ← tryIOError
-              $ withLogLock lk nm
-              $ BS.readFile fp
-
-  case allLogDataE of
-    Left e | isDoesNotExistError e → return []
-           | otherwise             → ioError e
-    Right allLogData → do
-        let logLines = BS.split (fromIntegral $ ord '\n') allLogData
-            logMsgs = readLogMsg <$> logLines
-            onlyMatching = (case limitMay of
-                              Nothing → id
-                              Just limit → take limit)
-                         . (case levelMay of
-                             Nothing → id
-                             Just level → filter (\(LogMsg l _) → l == level))
-
-        when (Nothing `L.elem` logMsgs) $
-          warn $ printf "Log file contains an invalid line: %s" fp
-
-        return $ onlyMatching $ catMaybes logMsgs
+queryLog ∷ (LogLock,P.FilePath) → ReadQuery → IO [Log]
+queryLog config (ReadQuery nm levelMay limitMay) = do
+  src ← logFile config nm
+  let logs = src $= toLogs nm
+  let filteredLogs = case levelMay of Nothing → logs
+                                      Just l → logs $= levelGE l
+  let limitedLogs = case limitMay of Nothing → filteredLogs $$ sinkVector
+                                     Just n → filteredLogs $$ sinkVecLastN n
+  BV.toList <$> runResourceT (C.runConduit limitedLogs)
 
 
 -- Server Stuff ----------------------------------------------------------------
@@ -320,7 +307,7 @@ type Api = "read" :> Capture "logname" LogName
 apiServer ∷ (LogLock,P.FilePath) → W.Application
 apiServer config = serve (Proxy∷Proxy Api) $ readH :<|> logH
   where readH nm limit level = liftIO $
-          map (Log nm) <$> queryLog config (ReadQuery nm level limit)
+          queryLog config (ReadQuery nm level limit)
 
         logH entry = do
           _ ← liftIO $ appendLog config entry
