@@ -14,11 +14,13 @@
 -- tests. This is pretty questionable! However, I'm going to keep this
 -- behavior for now to simplify my code.
 
+-- TODO `servant` sends shitty response texts when there's an exception.
+--      Handle them manually.
 -- TODO Stream JSON text directly to the WAI response using `responseStream`.
 -- TODO Look into reading the log file back-to-front. The current approach
 --      will not scale to larger log files.
 
-module Main where
+module Main (main,test) where
 
 import Control.Applicative
 import Control.Monad.IO.Class
@@ -60,7 +62,6 @@ import           Filesystem.Path.CurrentOS ((</>))
 import qualified Filesystem.Path.CurrentOS as P
 import           System.Directory
 import           System.Environment
-import           System.IO
 import           System.IO.Error
 import           System.Posix.Files
 
@@ -87,13 +88,6 @@ data LogMsg = LogMsg LogLevel LogText
 data ReadQuery = ReadQuery LogName (Maybe LogLevel) (Maybe Int)
 
 data Log = Log LogName LogMsg
-
-data Req = LogReq Log
-         | ReadReq ReadQuery
-
-data ReqError = InvalidEndpoint
-              | InvalidQueryParam
-              | InvalidBody Text
 
 newtype LogLock = LogLockInternal { unLogLock ∷ MVar () }
 
@@ -137,16 +131,9 @@ instance FromText LogName where
 
 -- Utilities -------------------------------------------------------------------
 
-warn ∷ String → IO ()
-warn = hPutStrLn stderr . ("Warning: " ++)
-
 toMaybe ∷ Either a b → Maybe b
 toMaybe (Left _)  = Nothing
 toMaybe (Right r) = Just r
-
-toEither ∷ a → Maybe b → Either a b
-toEither l Nothing  = Left l
-toEither _ (Just r) = Right r
 
 safeRead ∷ Read a => String → Maybe a
 safeRead t = case reads t of
@@ -253,31 +240,25 @@ instance J.ToJSON Log where
 
 -- Log File IO -----------------------------------------------------------------
 
-appendLog ∷ (LogLock,P.FilePath) → Log → IO ()
-appendLog (lk,logDir) (Log n m) =
-  let fp = logDir </> logNamePath n
-      msg = showLogMsg m
-  in withLogLock lk n $ do
-         createDirectoryIfMissing True $ P.encodeString logDir
-         BS.appendFile (P.encodeString fp) msg
-
--- Here, we rely on the fact that our IO files are append-only to keep the
--- lock duraction very short. We use the lock to grab the size of the
--- file, and then we stream the first n bytes of the file. This way, even
--- if the end of the file goes into an inconsistent state while we are reading,
--- this doesn't affect us.
-logFile ∷ MonadResource m => (LogLock,P.FilePath) →
-                             LogName →
-                             IO (Source m ByteString)
-logFile (lk,logDir) nm = do
+-- If we don't have permissions to read a file, getFileStatus tells us
+-- that the file size is zero. This is annoying, because it
+-- `CB.sourceFile` wont open the file if we ask for zero bytes from
+-- it. This causes permission errors to go unreported.
+--
+-- Since we want an exception to be thrown when we try to read from
+-- files that we don't have permissions for, we return 1 instead. This is
+-- NOT a good solution, and needs to be cleaned up.
+getLogFileSize ∷ (LogLock,P.FilePath) → LogName → IO (Maybe Int)
+getLogFileSize (lk,logDir) nm = do
     let fp = P.encodeString $ logDir </> logNamePath nm
     filesizeE ← withLogLock lk nm
               $ tryIOError
               $ fromIntegral . fileSize <$> getFileStatus fp
     case filesizeE of
-      Left e | isDoesNotExistError e → return C.sourceNull
-             | otherwise             → ioError e
-      Right sz                       → return $ CB.sourceFile fp $= takeCE sz
+      Left e | isDoesNotExistError e → return Nothing
+      Left e | otherwise             → ioError e
+      Right 0                        → return $ Just 1 -- TODO HACK
+      Right sz                       → return $ Just sz
 
 logLevelGE ∷ Monad m => LogLevel → Conduit Log m Log
 logLevelGE minLevel = filterC $ \l → logLevel l >= minLevel
@@ -302,15 +283,30 @@ type Api = "read" :> Capture "logname" LogName
                  :> Post Log
 
 apiServer ∷ (LogLock,P.FilePath) → W.Application
-apiServer config = serve (Proxy∷Proxy Api) $ readH :<|> logH
-  where readH nm limit level = liftIO $ do
-            bytes ← logFile config nm
-            let q = ReadQuery nm level limit
-            runResourceT $ C.runConduit $ bytes $= queryLogs q $$ sinkList
+apiServer config@(lk,logDir) = serve (Proxy∷Proxy Api) $ readH :<|> logH
 
-        logH entry = do
-            _ ← liftIO $ appendLog config entry
-            return entry
+  where readH nm limit level = liftIO $ do
+            -- Here, we rely on the fact that our IO files are append-only
+            -- to keep the lock duraction very short. We use the lock only to
+            -- grab the size of the file, and then we stream the first n
+            -- bytes of the file. This way, even if the end of the file goes
+            -- into an inconsistent state while we are reading, this doesn't
+            -- affect us.
+            szM ← getLogFileSize config nm
+            let fp = P.encodeString (logDir </> logNamePath nm)
+            case szM of
+              Nothing → return []
+              Just sz → do
+                let q = ReadQuery nm level limit
+                runResourceT $ C.runConduit $
+                  CB.sourceFile fp $= takeCE sz $= queryLogs q $$ sinkList
+
+        logH entry@(Log nm m) = liftIO $
+            let fp = P.encodeString (logDir </> logNamePath nm)
+            in do withLogLock lk nm $ do
+                      createDirectoryIfMissing True $ P.encodeString logDir
+                      BS.appendFile fp (showLogMsg m)
+                  return entry
 
 
 -- Testing ---------------------------------------------------------------------
@@ -352,6 +348,7 @@ test = defaultMain $ testGroup "tests"
   , testCase "LogLevel ordering" $
       Debug<Info && Info<Warn && Warn<Error @?= True
   ]
+
 
 -- Entry Point -----------------------------------------------------------------
 
