@@ -14,7 +14,7 @@ executable logtoy
   default-language:    Haskell2010
   build-depends:       aeson
                      , attoparsec
-                     , base >=4.7 && <4.8
+                     , base >=4.7 && <4.10
                      , bytestring
                      , conduit
                      , conduit-combinators

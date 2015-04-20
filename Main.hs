@@ -192,11 +192,11 @@ fuseMaybe source (Just c) = source $= c
 
 readLogMsg ∷ ByteString → Maybe LogMsg
 readLogMsg bs = toMaybe $ flip A.parseOnly bs $ do
-    let strToText = T.decodeUtf8 . BS.pack
+    let bsToText = T.decodeUtf8 . BS.pack
     _ ← A8.char '['
     Just l ← fromText . T.decodeUtf8 <$> A8.takeWhile A8.isAlpha_ascii
     _ ← A8.char ']'
-    m ← mkLogText . strToText <$> A.many' (A.notWord8 $ fromIntegral $ ord '\n')
+    m ← mkLogText . bsToText <$> A.many' (A.notWord8 $ fromIntegral $ ord '\n')
     return $ LogMsg l m
 
 showLogMsg ∷ LogMsg → ByteString
@@ -247,10 +247,12 @@ instance J.ToJSON Log where
 
 -- Log File IO -----------------------------------------------------------------
 
+logFile ∷ P.FilePath → LogName → FilePath
+logFile logDir nm = P.encodeString $ logDir </> logNamePath nm
+
 getLogFileSize ∷ (LogLock,P.FilePath) → LogName → IO Int
-getLogFileSize (lk,logDir) nm = do
-    let fp = P.encodeString $ logDir </> logNamePath nm
-    withLogLock lk nm $ fromIntegral . fileSize <$> getFileStatus fp
+getLogFileSize (lk,ld) nm =
+  withLogLock lk nm $ fromIntegral . fileSize <$> getFileStatus(logFile ld nm)
 
 logLevelGE ∷ Monad m => LogLevel → Conduit Log m Log
 logLevelGE minLevel = filterC $ \l → logLevel l >= minLevel
@@ -285,7 +287,7 @@ type Api = "read" :> Capture "logname" LogName
 getLogs :: MonadIO m =>
            (LogLock,P.FilePath) → LogName → Maybe Int → Maybe LogLevel → m [Log]
 getLogs (lk,logDir) nm limit level = liftIO $ do
-    let fp = P.encodeString (logDir </> logNamePath nm)
+    let fp = logFile logDir nm
     sz ← getLogFileSize (lk,logDir) nm
     when (sz == 0) $ withFile fp ReadMode (void . hGetChar)
     let q = ReadQuery nm level limit
@@ -293,12 +295,11 @@ getLogs (lk,logDir) nm limit level = liftIO $ do
       CB.sourceFile fp $= takeCE sz $= queryLogs q $$ sinkList
 
 appendLog ∷ MonadIO m => (LogLock, P.FilePath) → Log → m Log
-appendLog (lk,logDir) entry@(Log nm m) = liftIO $
-    let fp = P.encodeString (logDir </> logNamePath nm)
-    in do withLogLock lk nm $ do
-              createDirectoryIfMissing True $ P.encodeString logDir
-              BS.appendFile fp (showLogMsg m)
-          return entry
+appendLog (lk,logDir) entry@(Log nm m) =
+  liftIO $ withLogLock lk nm $ do
+      createDirectoryIfMissing True $ P.encodeString logDir
+      BS.appendFile (logFile logDir nm) (showLogMsg m)
+      return entry
 
 apiServer ∷ (LogLock,P.FilePath) → W.Application
 apiServer config = serve (Proxy∷Proxy Api) (readH :<|> logH)
