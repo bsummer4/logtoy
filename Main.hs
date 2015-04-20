@@ -9,15 +9,14 @@
 -- `fsync()` might be worth consideration. Do we care about losing some
 -- logs if the system crashes? I'm going to go with "no" for now.
 
--- `servant` ignores invalid query parameters.  For example, making
--- a request to '/read/test?level=warnn' returns all of the logs in
--- tests. This is pretty questionable! However, I'm going to keep this
--- behavior for now to simplify my code.
+-- `servant` does not validate the request method. It accepts
+-- requests from any method without complaint. Also, `servant`
+-- ignores invalid query parameters.  For example, making a request to
+-- '/read/test?level=warnn' returns all of the logs in tests. This is
+-- pretty questionable! However, I'm going to keep this behavior for
+-- now to simplify my code.
 
 -- TODO Return `[]` when the file for a LogName doesn't exist.
--- TODO `servant` sends shitty response texts when there's an exception.
---      Handle them manually.
--- TODO Stream JSON text directly to the WAI response using `responseStream`.
 -- TODO Look into reading the log file back-to-front. The current approach
 --      will not scale to larger log files.
 
@@ -34,6 +33,8 @@ import qualified Data.Attoparsec.ByteString       as A
 import qualified Data.Attoparsec.ByteString.Char8 as A8
 import           Data.ByteString                  (ByteString)
 import qualified Data.ByteString                  as BS
+import qualified Data.ByteString.Builder          as BSB
+import qualified Data.ByteString.Lazy             as LBS
 import           Data.Char
 import           Data.Maybe
 import           Data.Text                        (Text)
@@ -55,7 +56,9 @@ import qualified Data.Conduit        as C
 import qualified Data.Conduit.Binary as CB
 import qualified Data.Conduit.List   as C
 
+import qualified Network.HTTP.Types       as W
 import qualified Network.Wai              as W
+import qualified Network.Wai.Conduit      as W
 import qualified Network.Wai.Handler.Warp as W
 
 import           Filesystem.Path.CurrentOS ((</>))
@@ -276,23 +279,57 @@ queryLogs (ReadQuery nm levelMay limitMay) =
 type Api = "read" :> Capture "logname" LogName
                   :> QueryParam "limit" Int
                   :> QueryParam "level" LogLevel
-                  :> Get [Log]
+                  :> Raw -- Get [Log]
       :<|> "log" :> ReqBody Log
                  :> Post Log
+
+-- Converts a stream of JSON values into a JSON list, and streams a
+-- serialized verison of that list.
+streamJSONList ∷ (J.ToJSON j,MonadIO m) ⇒ Conduit j m (Flush BSB.Builder)
+streamJSONList = go (0∷Integer) where
+  go sent = do
+      mx ← await
+      when (sent == 0) (yield $ C.Chunk $ BSB.char7 '[')
+      case mx of
+        Nothing → yield $ C.Chunk $ BSB.char7 ']'
+        Just j → do
+            unless (sent == 0) (yield $ C.Chunk $ BSB.char7 ',')
+            yield $ C.Chunk $ BSB.byteString $ LBS.toStrict $ J.encode j
+            when (0 == (sent+1) `mod` 1000) (yield C.Flush)
+            go (sent+1)
 
 -- Here, we rely on the fact that our IO files are append-only to keep
 -- the lock duraction very short. We use the lock only to grab the size of
 -- the file, and then we stream the first n bytes of the file. This way,
 -- even if the end of the file goes into an inconsistent state while we
 -- are reading, this doesn't affect us.
-getLogs :: MonadIO m =>
-           (LogLock,P.FilePath) → LogName → Maybe Int → Maybe LogLevel → m [Log]
-getLogs (lk,logDir) nm limit level = liftIO $ do
-    let fp = logFile logDir nm
-    sz ← getLogFileSize (lk,logDir) nm
-    let q = ReadQuery nm level limit
+getLogs ∷ (LogLock, P.FilePath)
+        → LogName → Maybe Int → Maybe LogLevel
+        → W.Application
+getLogs (lk,logDir) nm limit level req respond =
+  if W.requestMethod req /= "GET"
+  then
+    respond $ W.responseLBS W.status404 [] "Expecting a GET request"
+  else
+    do let fp = logFile logDir nm
+       sz ← liftIO $ getLogFileSize (lk,logDir) nm
+       let q = ReadQuery nm level limit
+       let logStream = CB.sourceFile fp $= CB.isolate sz $= queryLogs q
+       let jsonResp = ("Content-Type", "application/json")
+       respond $ responseSource W.status200 [jsonResp] $
+           logStream $= streamJSONList
+
+-- This is a modified version of Network.Wai.responseStream that runs
+-- in resourceT.
+responseSource ∷ W.Status
+               → W.ResponseHeaders
+               → Source (Sink () (ResourceT IO)) (Flush BSB.Builder)
+               → W.Response
+responseSource s hs src =
+  W.responseStream s hs $ \send flush ->
     runResourceT $ C.runConduit $
-      CB.sourceFile fp $= takeCE sz $= queryLogs q $$ sinkList
+      src $$ C.mapM_ (\case Chunk b -> liftIO $ send b
+                            Flush   -> liftIO flush)
 
 appendLog ∷ MonadIO m => (LogLock, P.FilePath) → Log → m Log
 appendLog (lk,logDir) entry@(Log nm m) =
@@ -303,8 +340,8 @@ appendLog (lk,logDir) entry@(Log nm m) =
 
 apiServer ∷ (LogLock,P.FilePath) → W.Application
 apiServer config = serve (Proxy∷Proxy Api) (readH :<|> logH)
-  where readH = getLogs config
-        logH  = appendLog config
+  where logH  = appendLog config
+        readH = getLogs config
 
 
 -- Testing ---------------------------------------------------------------------

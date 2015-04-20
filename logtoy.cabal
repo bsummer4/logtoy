@@ -36,6 +36,7 @@ executable logtoy
                      , unix
                      , vector
                      , wai
+                     , wai-conduit
                      , warp
                      , warp-tls
                      , primitive
