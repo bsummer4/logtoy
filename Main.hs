@@ -66,6 +66,7 @@ import qualified Filesystem.Path.CurrentOS as P
 import           System.Directory
 import           System.Environment
 import           System.IO
+import           System.IO.Error
 import           System.Posix.Files
 
 import Test.Tasty
@@ -251,8 +252,15 @@ logFile ∷ P.FilePath → LogName → FilePath
 logFile logDir nm = P.encodeString $ logDir </> logNamePath nm
 
 getLogFileSize ∷ (LogLock,P.FilePath) → LogName → IO Int
-getLogFileSize (lk,ld) nm =
-  withLogLock lk nm $ fromIntegral . fileSize <$> getFileStatus(logFile ld nm)
+getLogFileSize (lk,ld) nm = do
+    let fn = logFile ld nm
+        readError =
+          mkIOError permissionErrorType "getLogFileSize" Nothing (Just fn)
+    withLogLock lk nm $ do
+        haveAccess ← fileAccess fn True False False
+        unless haveAccess (ioError readError)
+        stat ← getFileStatus fn
+        return $ fromIntegral $ fileSize stat
 
 logLevelGE ∷ Monad m => LogLevel → Conduit Log m Log
 logLevelGE minLevel = filterC $ \l → logLevel l >= minLevel
@@ -279,17 +287,11 @@ type Api = "read" :> Capture "logname" LogName
 -- the file, and then we stream the first n bytes of the file. This way,
 -- even if the end of the file goes into an inconsistent state while we
 -- are reading, this doesn't affect us.
---
--- HACK ALERT: The `hGetChar` bit forces an exception to be thrown when
--- we don't have permissions to read a file. Otherwise, filesize will be
--- reported as zero, and then (CE.sourceFile) will never be asked for
--- any data, and wont ever try to read the file.
 getLogs :: MonadIO m =>
            (LogLock,P.FilePath) → LogName → Maybe Int → Maybe LogLevel → m [Log]
 getLogs (lk,logDir) nm limit level = liftIO $ do
     let fp = logFile logDir nm
     sz ← getLogFileSize (lk,logDir) nm
-    when (sz == 0) $ withFile fp ReadMode (void . hGetChar)
     let q = ReadQuery nm level limit
     runResourceT $ C.runConduit $
       CB.sourceFile fp $= takeCE sz $= queryLogs q $$ sinkList
