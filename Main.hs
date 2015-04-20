@@ -14,8 +14,10 @@
 -- tests. This is pretty questionable! However, I'm going to keep this
 -- behavior for now to simplify my code.
 
--- TODO Limit the size of `limit` at the API level, since we have to
---      allocate a vector of that size.
+-- TODO Since we automatically allocate a vector of size `limit`
+--      in sinkVecLastN, `limit` can be abuse to make the server
+--      allocate unreasonable amounts of memory. Storing the first `limit`
+--      entires in a list would solve this problem.
 -- TODO Return `[]` when the file for a LogName doesn't exist.
 -- TODO `servant` sends shitty response texts when there's an exception.
 --      Handle them manually.
