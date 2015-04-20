@@ -14,10 +14,6 @@
 -- tests. This is pretty questionable! However, I'm going to keep this
 -- behavior for now to simplify my code.
 
--- TODO Since we automatically allocate a vector of size `limit`
---      in sinkVecLastN, `limit` can be abuse to make the server
---      allocate unreasonable amounts of memory. Storing the first `limit`
---      entires in a list would solve this problem.
 -- TODO Return `[]` when the file for a LogName doesn't exist.
 -- TODO `servant` sends shitty response texts when there's an exception.
 --      Handle them manually.
@@ -27,7 +23,6 @@
 
 module Main (main,test) where
 
-import Control.Applicative
 import Control.Monad
 import Control.Monad.Primitive
 import Control.Monad.ST
@@ -67,7 +62,6 @@ import           Filesystem.Path.CurrentOS ((</>))
 import qualified Filesystem.Path.CurrentOS as P
 import           System.Directory
 import           System.Environment
-import           System.IO
 import           System.IO.Error
 import           System.Posix.Files
 
@@ -156,29 +150,31 @@ enumerated ∷ (Enum a, Bounded a) => [a]
 enumerated = [minBound .. maxBound]
 
 rotateL ∷ (V.Vector v a) => Int → v a → v a
-rotateL offset vec =
+rotateL offset vec | (offset `mod` V.length vec) == 0 = vec
+rotateL offset vec                                    =
   V.generate sz $ \i → vec ! mod (i + offset) sz
     where sz = V.length vec
 
 -- Using a ring buffer.
 sinkVecLastN ∷ (MonadBase base m, V.Vector v a, PrimMonad base)
-                => Int -- ^ maximum allowed size
-                → Consumer a m (v a)
+            => Int
+             → Consumer a m (v a)
 sinkVecLastN maxSize | maxSize <= 0 = return V.empty
 sinkVecLastN maxSize                = do
-    mv <- liftBase $ VM.new maxSize
-    let go n = do
-            let i = n `mod` maxSize
-            mx <- await
-            case mx of
-                Nothing -> do
-                    let frozen = liftBase (V.unsafeFreeze mv)
-                    if n < maxSize then V.slice 0 i <$> frozen
-                                   else rotateL i <$> frozen
-                Just x -> do
-                    liftBase $ VM.write mv i x
-                    go (n + 1)
-    go 0
+    firstN ← takeC maxSize $= sinkVector
+    case compare (V.length firstN) maxSize of
+      LT → return firstN
+      GT → error "Conduit.take returned too many elements!"
+      EQ → do
+          mv <- liftBase $ V.unsafeThaw firstN
+          let go n = do
+                  let i = n `mod` maxSize
+                  mx <- await
+                  case mx of
+                      Nothing -> rotateL i <$> liftBase (V.unsafeFreeze mv)
+                      Just x  -> do liftBase $ VM.write mv i x
+                                    go (n + 1)
+          go 0
 
 lastNC ∷ (MonadBase base m, PrimMonad base) => Int → Conduit a m a
 lastNC n = sinkVecLastN n >>= BV.mapM_ yield
@@ -348,8 +344,10 @@ test = defaultMain $ testGroup "tests"
       showLogMsg (LogMsg Debug (mkLogText "fo\no")) @?= "[Debug] foo\n"
 
   , QC.testProperty "lastN == (\\n → reverse . take n . reverse)" $
-       \n (l∷[Int]) → let len = n `mod` 100000
-                      in reverse (take len $ reverse l) == lastN len l
+       \len (l∷[Int]) → reverse (take len $ reverse l) == lastN len l
+
+  , QC.testProperty "lastN handles absurd values for N" $
+      \(l∷[Int]) → lastN minBound l == [] && lastN maxBound l == l
 
   , testCase "LogLevel ordering" $
       Debug<Info && Info<Warn && Warn<Error @?= True
