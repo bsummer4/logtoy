@@ -2,29 +2,46 @@
 {-# LANGUAGE OverloadedStrings, PolyKinds, RankNTypes, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, TypeOperators, UnicodeSyntax                    #-}
 
--- Handling of IOErrors probably deserves more attention, however warp
--- seems to do the right thing when it encounters unexpected IO errors. It
--- returns a 500 error and prints a warning to stderr.
+{-
+  # Concerns
 
--- `fsync()` might be worth consideration. Do we care about losing some
--- logs if the system crashes? I'm going to go with "no" for now.
+  Current, logs files are read start-to-end even though the limit parameter
+  yields the last `n` logs. This is a problem, since reads on long files take
+  linear time wrt the file length. It should be possible to efficiently
+  read the file backwards, and that's probably worth doing here.
 
--- `servant` does not validate the request method. It accepts
--- requests from any method without complaint. Also, `servant`
--- ignores invalid query parameters.  For example, making a request to
--- '/read/test?level=warnn' returns all of the logs in tests. This is
--- pretty questionable! However, I'm going to keep this behavior for
--- now to simplify my code.
+  When using the `limit` parameter on a large log file, we need to keep all
+  of the results in memory. This has abuse potential. Some solutions that
+  are worth consideration:
 
--- TODO Look into reading the log file back-to-front. The current approach
---      will not scale to larger log files.
+    - Put a maximum bound on the `limit` parameter.
+    - Archive old logs to keep the log files form becoming too large.
+    - Return logs in reverse order, and also read the log file in reverse
+      order. This would allow us to stream the logs in constant memory.
+
+  Some IO exceptions are not handled, however warp seems to do the right
+  in these situations. It returns a 500 error and prints a warning
+  to stderr.
+
+  Using `fsync()` on writes might be worth consideration. Do we care
+  about losing some logs if the system crashes? I'm going to go with "no"
+  for now.
+
+  `servant` does not do much validation on the requests, but it would
+  take a lot of code to do the validation myself. Specifically,
+
+    - it does not validate the request method. It accepts requests from
+      any method without complaint.
+    - it ignores invalid query parameters.  For example, making a request
+      to '/read/test?level=warnn' returns all of the logs in tests.
+-}
 
 module Main (main,test) where
 
+import Control.Concurrent.MVar
 import Control.Monad
 import Control.Monad.Primitive
 import Control.Monad.ST
-import Data.Proxy
 
 import           Data.Aeson                       ((.:), (.=))
 import qualified Data.Aeson                       as J
@@ -36,19 +53,17 @@ import qualified Data.ByteString.Builder          as BSB
 import qualified Data.ByteString.Lazy             as LBS
 import           Data.Char
 import           Data.Maybe
+import           Data.Monoid
+import           Data.Proxy
 import           Data.Text                        (Text)
 import qualified Data.Text                        as T
 import qualified Data.Text.Encoding               as T
 import qualified Data.Text.Format                 as T
 import qualified Data.Text.Lazy                   as LT
-import           Text.Printf
-
-import Control.Concurrent.MVar
-
-import qualified Data.Vector                 as BV
-import           Data.Vector.Generic         ((!))
-import qualified Data.Vector.Generic         as V
-import qualified Data.Vector.Generic.Mutable as VM
+import qualified Data.Vector                      as BV
+import           Data.Vector.Generic              ((!))
+import qualified Data.Vector.Generic              as V
+import qualified Data.Vector.Generic.Mutable      as VM
 
 import           Conduit
 import qualified Data.Conduit        as C
@@ -57,7 +72,6 @@ import qualified Data.Conduit.List   as C
 
 import qualified Network.HTTP.Types       as W
 import qualified Network.Wai              as W
-import qualified Network.Wai.Conduit      as W
 import qualified Network.Wai.Handler.Warp as W
 
 import           Filesystem.Path.CurrentOS ((</>))
@@ -72,8 +86,7 @@ import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck as QC
 
 import Servant
-
-import Data.Monoid
+import Text.Printf
 
 
 -- Types -----------------------------------------------------------------------
@@ -151,26 +164,28 @@ mkAbsolute wd p                = P.collapse(wd </> p)
 enumerated ∷ (Enum a, Bounded a) => [a]
 enumerated = [minBound .. maxBound]
 
+-- Rotate the elements of a vector left by `offset` elements.
 rotateL ∷ (V.Vector v a) => Int → v a → v a
 rotateL offset vec | (offset `mod` V.length vec) == 0 = vec
 rotateL offset vec                                    =
   V.generate sz $ \i → vec ! mod (i + offset) sz
     where sz = V.length vec
 
--- Using a ring buffer.
+-- Using an internal ring buffer, return a vector containing the last
+-- `nElems` elements of a Conduit stream.
 sinkVecLastN ∷ (MonadBase base m, V.Vector v a, PrimMonad base)
             => Int
              → Consumer a m (v a)
-sinkVecLastN maxSize | maxSize <= 0 = return V.empty
-sinkVecLastN maxSize                = do
-    firstN ← takeC maxSize $= sinkVector
-    case compare (V.length firstN) maxSize of
+sinkVecLastN nElems | nElems <= 0 = return V.empty
+sinkVecLastN nElems               = do
+    firstN ← takeC nElems $= sinkVector
+    case compare (V.length firstN) nElems of
       LT → return firstN
       GT → error "Conduit.take returned too many elements!"
       EQ → do
           mv <- liftBase $ V.unsafeThaw firstN
           let go n = do
-                  let i = n `mod` maxSize
+                  let i = n `mod` nElems
                   mx <- await
                   case mx of
                       Nothing -> rotateL i <$> liftBase (V.unsafeFreeze mv)
@@ -178,9 +193,11 @@ sinkVecLastN maxSize                = do
                                     go (n + 1)
           go 0
 
+-- Yeild the final n elements of a stream.
 lastNC ∷ (MonadBase base m, PrimMonad base) => Int → Conduit a m a
 lastNC n = sinkVecLastN n >>= BV.mapM_ yield
 
+-- The last n elements of a list.
 lastN ∷ Int → [a] → [a]
 lastN n xs = runST $ C.runConduit $ C.sourceList xs $= lastNC n $$ sinkList
 
@@ -188,9 +205,22 @@ fuseMaybe ∷ Monad m => Conduit a m b → Maybe (Conduit b m b) → Conduit a m
 fuseMaybe source Nothing  = source
 fuseMaybe source (Just c) = source $= c
 
+-- This is a modified version of Network.Wai.responseStream that runs
+-- in resourceT.
+responseSource ∷ W.Status
+               → W.ResponseHeaders
+               → Source (Sink () (ResourceT IO)) (Flush BSB.Builder)
+               → W.Response
+responseSource s hs src =
+  W.responseStream s hs $ \send flush ->
+    runResourceT $ C.runConduit $
+      src $$ C.mapM_ (\case Chunk b -> liftIO $ send b
+                            Flush   -> liftIO flush)
+
 
 -- Lines in Log Files ----------------------------------------------------------
 
+-- attoparsec parser for log messages.
 readLogMsg ∷ ByteString → Maybe LogMsg
 readLogMsg bs = toMaybe $ flip A.parseOnly bs $ do
     let bsToText = T.decodeUtf8 . BS.pack
@@ -251,6 +281,7 @@ instance J.ToJSON Log where
 logFile ∷ P.FilePath → LogName → FilePath
 logFile logDir nm = P.encodeString $ logDir </> logNamePath nm
 
+-- Throws a permission error if we don't have read access to the file.
 getLogFileSize ∷ (LogLock,P.FilePath) → LogName → IO Int
 getLogFileSize (lk,ld) nm = do
     let fn = logFile ld nm
@@ -262,15 +293,15 @@ getLogFileSize (lk,ld) nm = do
         stat ← getFileStatus fn
         return $ fromIntegral $ fileSize stat
 
-logLevelGE ∷ Monad m => LogLevel → Conduit Log m Log
-logLevelGE minLevel = filterC $ \l → logLevel l >= minLevel
+logLevelsGE ∷ Monad m => LogLevel → Conduit Log m Log
+logLevelsGE minLevel = filterC (\l → logLevel l >= minLevel)
   where logLevel (Log _ (LogMsg l _)) = l
 
 queryLogs ∷ (MonadBase b m,PrimMonad b) => ReadQuery → Conduit ByteString m Log
 queryLogs (ReadQuery nm levelMay limitMay) =
   CB.lines $= C.mapMaybe (fmap (Log nm) . readLogMsg)
-    `fuseMaybe` (logLevelGE <$> levelMay)
-    `fuseMaybe` (lastNC     <$> limitMay)
+    `fuseMaybe` (logLevelsGE <$> levelMay)
+    `fuseMaybe` (lastNC      <$> limitMay)
 
 
 -- Server Stuff ----------------------------------------------------------------
@@ -297,14 +328,21 @@ streamJSONList = go (0∷Integer) where
             when (0 == (sent+1) `mod` 1000) (yield C.Flush)
             go (sent+1)
 
+appendLog ∷ MonadIO m => (LogLock, P.FilePath) → Log → m Log
+appendLog (lk,logDir) entry@(Log nm m) =
+  liftIO $ withLogLock lk nm $ do
+      createDirectoryIfMissing True $ P.encodeString logDir
+      BS.appendFile (logFile logDir nm) (showLogMsg m)
+      return entry
+
 -- Here, we rely on the fact that our IO files are append-only to keep
 -- the lock duraction very short. We use the lock only to grab the size of
 -- the file, and then we stream the first n bytes of the file. This way,
 -- even if the end of the file goes into an inconsistent state while we
 -- are reading, this doesn't affect us.
 --
--- HACK ALERT: Note that if the file does not exist, we pretend that we
--- are reading from a file with size 0. If `Conduit.Binary.sourceFile`
+-- HACK ALERT: If the file does not exist, we pretend that we are
+-- reading from a file with size 0. If `Conduit.Binary.sourceFile`
 -- is never asked for any chunks, then the file will never be read. We
 -- rely on this behavior to avoid getting further io errors from trying
 -- to read the non-existent file.
@@ -326,25 +364,6 @@ getLogs (lk,logDir) nm limit level req respond =
        let jsonResp = ("Content-Type", "application/json")
        respond $ responseSource W.status200 [jsonResp] $
            logStream $= streamJSONList
-
--- This is a modified version of Network.Wai.responseStream that runs
--- in resourceT.
-responseSource ∷ W.Status
-               → W.ResponseHeaders
-               → Source (Sink () (ResourceT IO)) (Flush BSB.Builder)
-               → W.Response
-responseSource s hs src =
-  W.responseStream s hs $ \send flush ->
-    runResourceT $ C.runConduit $
-      src $$ C.mapM_ (\case Chunk b -> liftIO $ send b
-                            Flush   -> liftIO flush)
-
-appendLog ∷ MonadIO m => (LogLock, P.FilePath) → Log → m Log
-appendLog (lk,logDir) entry@(Log nm m) =
-  liftIO $ withLogLock lk nm $ do
-      createDirectoryIfMissing True $ P.encodeString logDir
-      BS.appendFile (logFile logDir nm) (showLogMsg m)
-      return entry
 
 apiServer ∷ (LogLock,P.FilePath) → W.Application
 apiServer config = serve (Proxy∷Proxy Api) (readH :<|> logH)
