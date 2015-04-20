@@ -16,7 +16,6 @@
 -- pretty questionable! However, I'm going to keep this behavior for
 -- now to simplify my code.
 
--- TODO Return `[]` when the file for a LogName doesn't exist.
 -- TODO Look into reading the log file back-to-front. The current approach
 --      will not scale to larger log files.
 
@@ -303,6 +302,12 @@ streamJSONList = go (0∷Integer) where
 -- the file, and then we stream the first n bytes of the file. This way,
 -- even if the end of the file goes into an inconsistent state while we
 -- are reading, this doesn't affect us.
+--
+-- HACK ALERT: Note that if the file does not exist, we pretend that we
+-- are reading from a file with size 0. If `Conduit.Binary.sourceFile`
+-- is never asked for any chunks, then the file will never be read. We
+-- rely on this behavior to avoid getting further io errors from trying
+-- to read the non-existent file.
 getLogs ∷ (LogLock, P.FilePath)
         → LogName → Maybe Int → Maybe LogLevel
         → W.Application
@@ -312,7 +317,10 @@ getLogs (lk,logDir) nm limit level req respond =
     respond $ W.responseLBS W.status404 [] "Expecting a GET request"
   else
     do let fp = logFile logDir nm
-       sz ← liftIO $ getLogFileSize (lk,logDir) nm
+       szE ← liftIO $ tryIOError $ getLogFileSize (lk,logDir) nm
+       sz ← case szE of Left e | isDoesNotExistError e → return 0 -- See note.
+                        Left e                         → liftIO (ioError e)
+                        Right s                        → return (s∷Int)
        let q = ReadQuery nm level limit
        let logStream = CB.sourceFile fp $= CB.isolate sz $= queryLogs q
        let jsonResp = ("Content-Type", "application/json")
