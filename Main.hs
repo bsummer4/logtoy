@@ -38,7 +38,9 @@
 
 module Main (main,test) where
 
+import Control.Applicative
 import Control.Concurrent.MVar
+import Control.DeepSeq
 import Control.Monad
 import Control.Monad.Primitive
 import Control.Monad.ST
@@ -436,4 +438,4 @@ main = do
           where badPort = error $ printf "Invalid port number: %s" portS
 
     lk ← LogLockInternal <$> newMVar ()
-    W.run port $ apiServer (lk,logDir)
+    deepseq logDir $ W.run port $ apiServer (lk,logDir)
