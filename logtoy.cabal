@@ -1,6 +1,7 @@
 name:                logtoy
 version:             0.1.0.0
 synopsis:            A Toy Logging Service
+description:         A Toy Logging Service
 license:             MIT
 license-file:        LICENSE
 author:              Benjamin Summers
@@ -9,21 +10,26 @@ category:            Web
 build-type:          Simple
 cabal-version:       >=1.10
 
+source-repository head
+  type:     git
+  location: https://github.com/bsummer4/logtoy
+
 executable logtoy
   main-is:             Main.hs
   default-language:    Haskell2010
-  ghc-options:         -O2 -threaded
+  ghc-options:         -threaded -Wall
   build-depends:       aeson
                      , attoparsec
                      , base >=4.7 && <4.10
                      , bytestring
-                     , conduit
-                     , conduit-combinators
-                     , conduit-extra
                      , containers
                      , deepseq
                      , directory
                      , http-types
+                     , pipes
+                     , pipes-vector
+                     , pipes-wai
+                     , pipes-bytestring
                      , primitive
                      , QuickCheck
                      , servant-server
@@ -33,6 +39,7 @@ executable logtoy
                      , tasty-quickcheck
                      , text
                      , text-format
+                     , transformers-base
                      , unix
                      , vector
                      , wai

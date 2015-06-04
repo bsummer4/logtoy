@@ -42,6 +42,7 @@ import Control.Applicative
 import Control.Concurrent.MVar
 import Control.DeepSeq
 import Control.Monad
+import Control.Monad.Base
 import Control.Monad.Primitive
 import Control.Monad.ST
 
@@ -67,10 +68,11 @@ import           Data.Vector.Generic              ((!))
 import qualified Data.Vector.Generic              as V
 import qualified Data.Vector.Generic.Mutable      as VM
 
-import           Conduit
-import qualified Data.Conduit        as C
-import qualified Data.Conduit.Binary as CB
-import qualified Data.Conduit.List   as C
+import           Pipes
+import qualified Pipes.ByteString as PB
+import qualified Pipes.Prelude    as P
+import qualified Pipes.Vector     as P
+import qualified Pipes.Wai        as P
 
 import qualified Network.HTTP.Types       as W
 import qualified Network.Wai              as W
@@ -80,6 +82,7 @@ import           Filesystem.Path.CurrentOS ((</>))
 import qualified Filesystem.Path.CurrentOS as P
 import           System.Directory
 import           System.Environment
+import           System.IO (withFile, IOMode(ReadMode))
 import           System.IO.Error
 import           System.Posix.Files
 
@@ -87,7 +90,8 @@ import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck as QC
 
-import Servant
+import Servant hiding (Proxy)
+import qualified Servant as Serv
 import Text.Printf
 
 
@@ -174,16 +178,16 @@ rotateL offset vec                                    =
     where sz = V.length vec
 
 -- Using an internal ring buffer, return a vector containing the last
--- `nElems` elements of a Conduit stream.
+-- `nElems` elements of a Pipe stream.
 sinkVecLastN ∷ (MonadBase base m, V.Vector v a, PrimMonad base)
             => Int
              → Consumer a m (v a)
 sinkVecLastN nElems | nElems <= 0 = return V.empty
 sinkVecLastN nElems               = do
-    firstN ← takeC nElems $= sinkVector
+    firstN ← P.runToVectorP $ P.take nElems >-> P.toVector
     case compare (V.length firstN) nElems of
       LT → return firstN
-      GT → error "Conduit.take returned too many elements!"
+      GT → error "Pipes.take returned too many elements!"
       EQ → do
           mv <- liftBase $ V.unsafeThaw firstN
           let go n = do
@@ -196,28 +200,28 @@ sinkVecLastN nElems               = do
           go 0
 
 -- Yeild the final n elements of a stream.
-lastNC ∷ (MonadBase base m, PrimMonad base) => Int → Conduit a m a
+lastNC ∷ (MonadBase base m, PrimMonad base) => Int → Pipe a a m ()
 lastNC n = sinkVecLastN n >>= BV.mapM_ yield
 
 -- The last n elements of a list.
 lastN ∷ Int → [a] → [a]
-lastN n xs = runST $ C.runConduit $ C.sourceList xs $= lastNC n $$ sinkList
+lastN n xs = runST $ P.toListM $ each xs >-> lastNC n
 
-fuseMaybe ∷ Monad m => Conduit a m b → Maybe (Conduit b m b) → Conduit a m b
+fuseMaybe ∷ Monad m => Pipe a b m () → Maybe (Pipe b b m ()) → Pipe a b m ()
 fuseMaybe source Nothing  = source
-fuseMaybe source (Just c) = source $= c
+fuseMaybe source (Just c) = source >-> c
 
 -- This is a modified version of Network.Wai.responseStream that runs
 -- in resourceT.
-responseSource ∷ W.Status
-               → W.ResponseHeaders
-               → Source (Sink () (ResourceT IO)) (Flush BSB.Builder)
-               → W.Response
-responseSource s hs src =
-  W.responseStream s hs $ \send flush ->
-    runResourceT $ C.runConduit $
-      src $$ C.mapM_ (\case Chunk b -> liftIO $ send b
-                            Flush   -> liftIO flush)
+-- responseProducer ∷ W.Status
+               -- → W.ResponseHeaders
+               -- → Producer (Consumer () (ResourceT IO)) (Flush BSB.Builder)
+               -- → W.Response
+responseProducer s hs src = undefined
+  -- W.responseStream s hs $ \send flush ->
+    -- runResourceT $ runEffect $
+      -- src $$ P.mapM_ (\case Chunk b -> liftIO $ send b
+                            -- Flush   -> liftIO flush)
 
 
 -- Lines in Log Files ----------------------------------------------------------
@@ -260,12 +264,12 @@ instance J.FromJSON LogLevel where
                   return <$> fromText s
 
 instance J.FromJSON LogName where
-  parseJSON = J.withText "log name" $ \s → do
+  parseJSON = J.withText "log name" $ \s →
                 fromMaybe (fail ("Invalid log name: " <> T.unpack s)) $
                  return <$> readLogName s
 
 instance J.FromJSON Log where
-  parseJSON = J.withObject "log" $ \v → do
+  parseJSON = J.withObject "log" $ \v →
                 Log <$> v .: "name"
                     <*> (LogMsg <$> v .: "level"
                                 <*> v .: "msg")
@@ -295,13 +299,13 @@ getLogFileSize (lk,ld) nm = do
         stat ← getFileStatus fn
         return $ fromIntegral $ fileSize stat
 
-logLevelsGE ∷ Monad m => LogLevel → Conduit Log m Log
-logLevelsGE minLevel = filterC (\l → logLevel l >= minLevel)
+logLevelsGE ∷ Monad m => LogLevel → Pipe Log Log m ()
+logLevelsGE minLevel = P.filter (\l → logLevel l >= minLevel)
   where logLevel (Log _ (LogMsg l _)) = l
 
-queryLogs ∷ (MonadBase b m,PrimMonad b) => ReadQuery → Conduit ByteString m Log
+queryLogs ∷ (MonadBase b m,PrimMonad b) => ReadQuery → Pipe ByteString Log m ()
 queryLogs (ReadQuery nm levelMay limitMay) =
-  CB.lines $= C.mapMaybe (fmap (Log nm) . readLogMsg)
+  PB.lines >-> P.mapFoldable (fmap (Log nm) . readLogMsg)
     `fuseMaybe` (logLevelsGE <$> levelMay)
     `fuseMaybe` (lastNC      <$> limitMay)
 
@@ -317,17 +321,17 @@ type Api = "read" :> Capture "logname" LogName
 
 -- Converts a stream of JSON values into a JSON list, and streams a
 -- serialized verison of that list.
-streamJSONList ∷ (J.ToJSON j,MonadIO m) ⇒ Conduit j m (Flush BSB.Builder)
+streamJSONList ∷ (J.ToJSON j,MonadIO m) ⇒ Pipe j (P.Flush BSB.Builder) m ()
 streamJSONList = go (0∷Integer) where
   go sent = do
       mx ← await
-      when (sent == 0) (yield $ C.Chunk $ BSB.char7 '[')
+      when (sent == 0) (yield $ P.Chunk $ BSB.char7 '[')
       case mx of
-        Nothing → yield $ C.Chunk $ BSB.char7 ']'
+        Nothing → yield $ P.Chunk $ BSB.char7 ']'
         Just j → do
-            unless (sent == 0) (yield $ C.Chunk $ BSB.char7 ',')
-            yield $ C.Chunk $ BSB.byteString $ LBS.toStrict $ J.encode j
-            when (0 == (sent+1) `mod` 1000) (yield C.Flush)
+            unless (sent == 0) (yield $ P.Chunk $ BSB.char7 ',')
+            yield $ P.Chunk $ BSB.byteString $ LBS.toStrict $ J.encode j
+            when (0 == (sent+1) `mod` 1000) (yield P.Flush)
             go (sent+1)
 
 appendLog ∷ MonadIO m => (LogLock, P.FilePath) → Log → m Log
@@ -337,6 +341,9 @@ appendLog (lk,logDir) entry@(Log nm m) =
       BS.appendFile (logFile logDir nm) (showLogMsg m)
       return entry
 
+sourceFile ∷ FilePath → Producer' ByteString m ()
+sourceFile fn = withFile fn ReadMode P.fromHandle
+
 -- Here, we rely on the fact that our IO files are append-only to keep
 -- the lock duraction very short. We use the lock only to grab the size of
 -- the file, and then we stream the first n bytes of the file. This way,
@@ -344,10 +351,10 @@ appendLog (lk,logDir) entry@(Log nm m) =
 -- are reading, this doesn't affect us.
 --
 -- HACK ALERT: If the file does not exist, we pretend that we are
--- reading from a file with size 0. If `Conduit.Binary.sourceFile`
--- is never asked for any chunks, then the file will never be read. We
--- rely on this behavior to avoid getting further io errors from trying
--- to read the non-existent file.
+-- reading from a file with size 0. If `sourceFile` is never asked
+-- for any chunks, then the file will never be read. We rely on
+-- this behavior to avoid getting further io errors from trying to
+-- read the non-existent file.
 getLogs ∷ (LogLock, P.FilePath)
         → LogName → Maybe Int → Maybe LogLevel
         → W.Application
@@ -362,13 +369,13 @@ getLogs (lk,logDir) nm limit level req respond =
                         Left e                         → liftIO (ioError e)
                         Right s                        → return (s∷Int)
        let q = ReadQuery nm level limit
-       let logStream = CB.sourceFile fp $= CB.isolate sz $= queryLogs q
+       let logStream = sourceFile fp >-> PB.take sz >-> queryLogs q
        let jsonResp = ("Content-Type", "application/json")
-       respond $ responseSource W.status200 [jsonResp] $
-           logStream $= streamJSONList
+       respond $ P.responseProducer W.status200 [jsonResp] $
+           logStream >-> streamJSONList
 
 apiServer ∷ (LogLock,P.FilePath) → W.Application
-apiServer config = serve (Proxy∷Proxy Api) (readH :<|> logH)
+apiServer config = serve (Serv.Proxy∷Serv.Proxy Api) (readH :<|> logH)
   where logH  = appendLog config
         readH = getLogs config
 
@@ -413,7 +420,7 @@ test = defaultMain $ testGroup "tests"
        \len (l∷[Int]) → reverse (take len $ reverse l) == lastN len l
 
   , QC.testProperty "lastN handles absurd values for N" $
-      \(l∷[Int]) → lastN minBound l == [] && lastN maxBound l == l
+      \(l∷[Int]) → null(lastN minBound l) && lastN maxBound l == l
 
   , testCase "LogLevel ordering" $
       Debug<Info && Info<Warn && Warn<Error @?= True
